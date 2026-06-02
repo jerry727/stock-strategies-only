@@ -142,17 +142,42 @@ def _market_sentiment(signals: list[dict]) -> str:
         return "🔴 偏空 — 普遍下跌，建議空手等待"
 
 
-def format_messages(
+def build_notification_payload(
     signals: list[dict],
-    watchlist: list[dict] = None,
-    market: dict = None,
-) -> list[str]:
-    """產生多則 Telegram 訊息"""
+    watchlist: list[dict] | None = None,
+    market: dict | None = None,
+) -> dict:
     buys = [s for s in signals if s.get("action") == "BUY"]
     watches = [s for s in signals if s.get("action") == "WATCH"]
     skips = [s for s in signals if s.get("action") in ("SKIP", "ERROR")]
     today = datetime.now().strftime("%Y/%m/%d")
-    total = len(signals)
+    return {
+        "date": today,
+        "signals": signals,
+        "watchlist": watchlist or [],
+        "market": market or {},
+        "summary": {
+            "total": len(signals),
+            "buy": len(buys),
+            "watch": len(watches),
+            "skip": len(skips),
+        },
+        "top_buys": buys,
+        "top_watches": watches[:8],
+        "sector_summary": _sector_summary(signals, watchlist) if watchlist else [],
+    }
+
+
+def render_telegram_messages(payload: dict) -> list[str]:
+    """由 payload 產生多則 Telegram 訊息"""
+    signals = payload.get("signals", [])
+    watchlist = payload.get("watchlist")
+    market = payload.get("market")
+    buys = payload.get("top_buys", [])
+    watches = [s for s in signals if s.get("action") == "WATCH"]
+    skips = [s for s in signals if s.get("action") in ("SKIP", "ERROR")]
+    today = payload.get("date", datetime.now().strftime("%Y/%m/%d"))
+    total = payload.get("summary", {}).get("total", len(signals))
     messages = []
 
     # === 第一則：市場總覽 + 類股強弱 ===
@@ -359,6 +384,15 @@ def _format_volume_block(s: dict) -> list[str]:
     if verdict:
         lines.append(f"  結論: {verdict}")
     return lines
+
+
+def format_messages(
+    signals: list[dict],
+    watchlist: list[dict] | None = None,
+    market: dict | None = None,
+) -> list[str]:
+    payload = build_notification_payload(signals, watchlist=watchlist, market=market)
+    return render_telegram_messages(payload)
 
 
 def format_message(signals: list[dict]) -> str:

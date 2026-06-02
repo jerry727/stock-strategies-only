@@ -2,59 +2,33 @@
 
 啟動：
   uv run uvicorn api.main:app --reload --port 8000
-
-提供：
-  GET    /api/health
-  GET    /api/strategies              列出所有策略
-  GET    /api/strategies/defaults     回傳預設參數 schema
-  GET    /api/strategies/{id}         取單一策略
-  POST   /api/strategies              新增 / 更新策略
-  DELETE /api/strategies/{id}         刪除
-  POST   /api/strategies/generate     AI 生策略 (Gemini)
-  GET    /api/market                  目前大盤狀態
-  GET    /api/watchlist               讀 watchlist
-  POST   /api/run                     用指定策略跑一次完整評分
 """
 
 from __future__ import annotations
 
-import os
-import time
-import traceback
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-try:
-    from dotenv import load_dotenv
-
-    load_dotenv()
-except ImportError:
-    pass
-
 from stock_strategies import loader
-from stock_strategies.evaluate import evaluate
-from stock_strategies.market import apply_market_filter, get_market_state
+from stock_strategies.market import get_market_state
 from stock_strategies.sheet import read_watchlist
+from stock_strategies.run_store import get_run_by_id, latest_run, list_runs
+from main import run_pipeline
 
 from api.services.ai_generator import generate_strategy_with_ai
 
-app = FastAPI(title="Stock Strategies API", version="1.0.0")
+app = FastAPI(title="Stock Strategies API", version="1.1.0")
 
-# CORS：dev 期間給 localhost:3000 (Next.js)
-_origins_env = os.environ.get("CORS_ORIGINS", "http://localhost:3000")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in _origins_env.split(",") if o.strip()],
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# ---------- Schemas ----------
 
 
 class StrategyIn(BaseModel):
@@ -66,21 +40,21 @@ class StrategyIn(BaseModel):
 
 
 class AIGenerateIn(BaseModel):
-    prompt: str = Field(..., description="使用者用自然語言描述想要的策略風格")
+    prompt: str
     name: Optional[str] = None
 
 
 class RunIn(BaseModel):
     strategy_id: str
-    limit: Optional[int] = Field(None, description="只跑前 N 檔（debug 用）")
-
-
-# ---------- Routes ----------
+    limit: Optional[int] = None
+    no_telegram: bool = True
+    no_sheet: bool = True
+    no_performance: bool = True
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "ts": int(time.time())}
+    return {"ok": True}
 
 
 @app.get("/api/strategies")
@@ -104,8 +78,7 @@ def get_strategy(sid: str):
 @app.post("/api/strategies")
 def save_strategy(payload: StrategyIn):
     try:
-        clean = loader.save_strategy(payload.model_dump())
-        return clean
+        return loader.save_strategy(payload.model_dump())
     except loader.StrategyError as e:
         raise HTTPException(400, str(e))
 
@@ -123,10 +96,8 @@ def delete_strategy(sid: str):
 @app.post("/api/strategies/generate")
 def generate_strategy(payload: AIGenerateIn):
     try:
-        strategy = generate_strategy_with_ai(payload.prompt, name=payload.name)
-        return strategy
+        return generate_strategy_with_ai(payload.prompt, name=payload.name)
     except Exception as e:
-        traceback.print_exc()
         raise HTTPException(500, f"AI 生策略失敗：{e}")
 
 
@@ -140,7 +111,6 @@ def watchlist():
     try:
         return {"items": read_watchlist()}
     except Exception as e:
-        # 沒設定 Google Sheet 時不要整個 500
         return {"items": [], "error": str(e)}
 
 
@@ -149,49 +119,34 @@ def run(payload: RunIn):
     strategy = loader.get_strategy(payload.strategy_id)
     if not strategy:
         raise HTTPException(404, f"找不到策略 {payload.strategy_id}")
-
     try:
-        wl = read_watchlist()
+        return run_pipeline(
+            strategy_id=payload.strategy_id,
+            limit=payload.limit,
+            send_notifications=not payload.no_telegram,
+            write_sheet_enabled=not payload.no_sheet,
+            write_performance_enabled=not payload.no_performance,
+        )
     except Exception as e:
-        raise HTTPException(500, f"讀取 watchlist 失敗：{e}")
+        raise HTTPException(500, str(e))
 
-    if payload.limit:
-        wl = wl[: payload.limit]
 
-    params = strategy["params"]
-    market_filter_on = params.get("market_filter_enabled", True)
-    if market_filter_on:
-        market_state = get_market_state(int(params.get("market_filter_ma_period", 20)))
-    else:
-        market_state = {"bullish": True, "note": "已關閉大盤濾鏡"}
+@app.get("/api/runs/latest")
+def api_latest_run(strategy_id: Optional[str] = None):
+    data = latest_run(strategy_id=strategy_id)
+    if not data:
+        raise HTTPException(404, "找不到最新 run")
+    return data
 
-    results = []
-    for row in wl:
-        sid = str(row["stock_id"])
-        name = row.get("name", "")
-        r = evaluate(sid, name, strategy=strategy)
-        if r:
-            results.append(r)
-        time.sleep(0.4)
 
-    if market_filter_on:
-        downgraded = apply_market_filter(results, market_state)
-    else:
-        downgraded = 0
+@app.get("/api/runs")
+def api_list_runs(strategy_id: Optional[str] = None, limit: int = 20):
+    return {"runs": list_runs(strategy_id=strategy_id, limit=limit)}
 
-    order = {"BUY": 0, "WATCH": 1, "SKIP": 2, "ERROR": 3}
-    results.sort(key=lambda x: (order.get(x.get("action"), 4), -x.get("signal_score", 0)))
 
-    return {
-        "strategy": {"id": strategy["id"], "name": strategy["name"]},
-        "market": market_state,
-        "downgraded": downgraded,
-        "summary": {
-            "total": len(results),
-            "buy": sum(1 for r in results if r.get("action") == "BUY"),
-            "watch": sum(1 for r in results if r.get("action") == "WATCH"),
-            "skip": sum(1 for r in results if r.get("action") == "SKIP"),
-            "error": sum(1 for r in results if r.get("action") == "ERROR"),
-        },
-        "results": results,
-    }
+@app.get("/api/runs/{run_id}")
+def api_get_run(run_id: str):
+    data = get_run_by_id(run_id)
+    if not data:
+        raise HTTPException(404, f"找不到 run {run_id}")
+    return data

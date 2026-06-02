@@ -1,14 +1,5 @@
-"""
-V3.2 每日選股訊號系統
-
-新增：
-- 回測以「訊號日隔天開盤價」為進場（符合真實可執行）
-- 大盤濾鏡：加權指數跌破月線時，BUY 自動降為 WATCH
-- 成績單：自動追蹤每個 BUY 在 T+1/T+5/T+10/T+20 的實際表現
-
-執行: uv run python main.py
-"""
-
+import argparse
+import json
 import os
 import sys
 import time
@@ -30,6 +21,8 @@ from stock_strategies.evaluate import evaluate
 from stock_strategies.notify import send_telegram, format_messages
 from stock_strategies.market import get_market_state, apply_market_filter
 from stock_strategies.performance import update_performance, summary as perf_summary
+from stock_strategies import loader
+from stock_strategies.run_store import save_run_result
 
 
 REQUIRED_ENV = [
@@ -41,95 +34,113 @@ REQUIRED_ENV = [
 ]
 
 
-def main():
-    missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
+def run_pipeline(
+    strategy_id: str = "default",
+    limit: int | None = None,
+    send_notifications: bool = True,
+    write_sheet_enabled: bool = True,
+    write_performance_enabled: bool = True,
+    json_out: str | None = None,
+) -> dict:
+    strategy = loader.get_strategy(strategy_id) or {"id": strategy_id, "name": strategy_id, "params": {}}
+    needs_sheet = write_sheet_enabled or write_performance_enabled or send_notifications
+    missing = [k for k in REQUIRED_ENV if not os.environ.get(k)] if needs_sheet else []
     if missing:
-        print(f"❌ 缺少環境變數: {missing}", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(f"缺少環境變數: {missing}")
 
-    # 1. 讀取 watchlist
-    print(f"[{datetime.now()}] 讀取 watchlist...")
-    watchlist = read_watchlist()
-    print(f"  → {len(watchlist)} 檔啟用中")
+    if needs_sheet:
+        watchlist = read_watchlist()
+    else:
+        watchlist = []
+    if limit:
+        watchlist = watchlist[:limit]
 
-    # 2. 取得大盤狀態（濾鏡）
-    print("取得大盤狀態...")
     market = get_market_state()
-    print(f"  → {market['note']}")
-
-    # 3. 個股評分
     results = []
-    for i, row in enumerate(watchlist, 1):
+    for row in watchlist:
         sid = str(row["stock_id"])
         name = row.get("name", "")
-        print(f"[{i}/{len(watchlist)}] {sid} {name}")
-        r = evaluate(sid, name)
+        r = evaluate(sid, name, strategy=strategy)
         if r:
             results.append(r)
-        time.sleep(0.6)
+        time.sleep(0.1)
 
-    # 4. 套用大盤濾鏡：跌破月線時 BUY 一律降為 WATCH
     downgraded = apply_market_filter(results, market)
-    if downgraded:
-        print(f"⚠️ 大盤跌破月線，{downgraded} 檔 BUY 已自動降為 WATCH")
-
     order = {"BUY": 0, "WATCH": 1, "SKIP": 2, "ERROR": 3}
     results.sort(key=lambda x: (order.get(x.get("action"), 4), -x.get("signal_score", 0)))
 
-    buy_count = sum(1 for r in results if r["action"] == "BUY")
-    watch_count = sum(1 for r in results if r["action"] == "WATCH")
-    print(f"\n{buy_count} BUY, {watch_count} WATCH")
+    run_id = f"{datetime.now().strftime('%Y-%m-%dT%H-%M-%S')}_{strategy_id}"
+    created_at = datetime.now().isoformat()
 
-    # 5. 寫回 Signals 分頁
-    print("寫回 Google Sheet (Signals)...")
-    append_signals(results)
-
-    # 6. 更新 Performance 成績單（追蹤舊 BUY + 附上今日新 BUY）
-    print("更新 Performance 成績單...")
-    try:
+    performance_stats = None
+    if write_sheet_enabled:
+        append_signals(results)
+    if write_performance_enabled:
         existing_perf = read_performance()
         updated_perf = update_performance(existing_perf, results)
         write_performance(updated_perf)
-        stats = perf_summary(updated_perf)
-        if stats["count"] > 0:
-            print(
-                f"  → 已完成追蹤 {stats['count']} 筆 | "
-                f"T+20 勝率 {stats['winrate_t20']}% | "
-                f"平均報酬 {stats['avg_t20']}% | "
-                f"觸及停利 {stats['hit_target']} 次 / 停損 {stats['hit_stop']} 次"
-            )
-        else:
-            print("  → 尚未有完成追蹤的訊號（需累積 20 交易日）")
+        performance_stats = perf_summary(updated_perf)
+
+    if send_notifications:
+        for msg in format_messages(results, watchlist, market=market):
+            send_telegram(msg)
+            time.sleep(0.1)
+
+    payload = {
+        "run_id": run_id,
+        "created_at": created_at,
+        "strategy": {"id": strategy.get("id", strategy_id), "name": strategy.get("name", strategy_id)},
+        "inputs": {"limit": limit, "strategy_id": strategy_id},
+        "market": market,
+        "downgraded": downgraded,
+        "summary": {
+            "total": len(results),
+            "buy": sum(1 for r in results if r.get("action") == "BUY"),
+            "watch": sum(1 for r in results if r.get("action") == "WATCH"),
+            "skip": sum(1 for r in results if r.get("action") == "SKIP"),
+            "error": sum(1 for r in results if r.get("action") == "ERROR"),
+        },
+        "results": results,
+        "performance_summary": performance_stats,
+        "artifacts": {},
+    }
+
+    artifact_path = save_run_result(payload)
+    payload["artifacts"]["json_path"] = artifact_path
+    if json_out:
+        with open(json_out, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        payload["artifacts"]["explicit_json_path"] = json_out
+    return payload
+
+
+def main():
+    parser = argparse.ArgumentParser(description="V3.2 每日選股訊號系統")
+    parser.add_argument("--strategy-id", default="default")
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--json-out", default=None)
+    parser.add_argument("--no-telegram", action="store_true")
+    parser.add_argument("--no-sheet", action="store_true")
+    parser.add_argument("--no-performance", action="store_true")
+    args = parser.parse_args()
+
+    try:
+        result = run_pipeline(
+            strategy_id=args.strategy_id,
+            limit=args.limit,
+            send_notifications=not args.no_telegram,
+            write_sheet_enabled=not args.no_sheet,
+            write_performance_enabled=not args.no_performance,
+            json_out=args.json_out,
+        )
     except Exception as e:
-        print(f"⚠️ Performance 追蹤失敗: {e}", file=sys.stderr)
-        stats = None
+        print(f"❌ {e}", file=sys.stderr)
+        sys.exit(1)
 
-    # 7. 發送 Telegram
-    print("發送 Telegram...")
-    for msg in format_messages(results, watchlist, market=market):
-        send_telegram(msg)
-        time.sleep(0.5)
-
-    # 8. 若有累積的成績單，額外推一則摘要
-    if stats and stats["count"] >= 5:
-        send_telegram(_format_perf_message(stats))
-
-    print("✅ 完成")
-
-
-def _format_perf_message(stats: dict) -> str:
-    lines = [
-        "📈 *系統成績單（累積追蹤）*",
-        "",
-        f"已完成追蹤訊號: {stats['count']} 筆",
-        f"T+20 勝率: {stats['winrate_t20']}%",
-        f"T+20 平均報酬: {stats['avg_t20']}%",
-        f"觸及停利 +{int(0.10 * 100)}%: {stats['hit_target']} 次",
-        f"觸及停損 -{int(0.08 * 100)}%: {stats['hit_stop']} 次",
-        "",
-        "_完整紀錄見 Google Sheet『Performance』分頁_",
-    ]
-    return "\n".join(lines)
+    print(
+        f"✅ 完成 | strategy={result['strategy']['id']} | total={result['summary']['total']} | "
+        f"BUY={result['summary']['buy']} WATCH={result['summary']['watch']} | artifact={result['artifacts'].get('json_path')}"
+    )
 
 
 if __name__ == "__main__":

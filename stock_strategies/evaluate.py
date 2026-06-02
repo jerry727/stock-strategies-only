@@ -21,6 +21,11 @@ def evaluate(stock_id: str, name: str, strategy: dict | None = None) -> Optional
         "date": datetime.now().strftime("%Y-%m-%d"),
         "strategy_id": (strategy or {}).get("id", "default"),
         "risk_notes": [],
+        "strategy_meta": {
+            "id": (strategy or {}).get("id", "default"),
+            "name": (strategy or {}).get("name", "Default"),
+            "params": params,
+        },
     }
 
     try:
@@ -109,6 +114,30 @@ def evaluate(stock_id: str, name: str, strategy: dict | None = None) -> Optional
         above_ma20 = latest["close"] > latest["ma20"] if pd.notna(latest["ma20"]) else False
         above_ma60 = latest["close"] > latest["ma60"] if pd.notna(latest["ma60"]) else False
 
+        gate_checks = {
+            "fundamental_pass": fund_pass,
+            "tech_score_pass": tech_score >= params["min_tech_score_for_buy"],
+            "total_score_pass": signal_score >= params["min_total_score_for_buy"],
+        }
+        buy_reasons = []
+        watch_reasons = []
+        skip_reasons = []
+        if fund_pass:
+            buy_reasons.append("基本面達標")
+        else:
+            watch_reasons.append("基本面未過門檻")
+            skip_reasons.append("基本面未過門檻")
+        if gate_checks["tech_score_pass"]:
+            buy_reasons.append("技術分達標")
+        else:
+            watch_reasons.append(f"技術分不足({tech_score})")
+            skip_reasons.append(f"技術分不足({tech_score})")
+        if gate_checks["total_score_pass"]:
+            buy_reasons.append("總分達標")
+        else:
+            watch_reasons.append(f"總分不足({signal_score})")
+            skip_reasons.append(f"總分不足({signal_score})")
+
         result.update({
             "action": action,
             "signal_score": signal_score,
@@ -124,6 +153,12 @@ def evaluate(stock_id: str, name: str, strategy: dict | None = None) -> Optional
                 "volume_details": vp["details"],
                 "volume_bonus": vp["bonus"],
                 "volume_verdict": volume_verdict(vp["patterns"]),
+            },
+            "explain": {
+                "gate_checks": gate_checks,
+                "buy_reasons": buy_reasons,
+                "watch_reasons": watch_reasons,
+                "skip_reasons": skip_reasons,
             },
             "trend": {
                 "chg_5d": round(chg_5d, 2),
