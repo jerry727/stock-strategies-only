@@ -50,6 +50,7 @@ class RunIn(BaseModel):
     no_telegram: bool = True
     no_sheet: bool = True
     no_performance: bool = True
+    watchlist: Optional[list[dict[str, Any]]] = None
 
 
 @app.get("/api/health")
@@ -126,6 +127,7 @@ def run(payload: RunIn):
             send_notifications=not payload.no_telegram,
             write_sheet_enabled=not payload.no_sheet,
             write_performance_enabled=not payload.no_performance,
+            watchlist_override=payload.watchlist,
         )
     except Exception as e:
         raise HTTPException(500, str(e))

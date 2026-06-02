@@ -41,14 +41,23 @@ def run_pipeline(
     write_sheet_enabled: bool = True,
     write_performance_enabled: bool = True,
     json_out: str | None = None,
+    watchlist_override: list[dict] | None = None,
 ) -> dict:
     strategy = loader.get_strategy(strategy_id) or {"id": strategy_id, "name": strategy_id, "params": {}}
     needs_sheet = write_sheet_enabled or write_performance_enabled or send_notifications
-    missing = [k for k in REQUIRED_ENV if not os.environ.get(k)] if needs_sheet else []
-    if missing:
-        raise RuntimeError(f"缺少環境變數: {missing}")
+    if needs_sheet:
+        missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
+        if missing:
+            raise RuntimeError(f"缺少環境變數: {missing}")
 
-    watchlist = read_watchlist()
+    if watchlist_override is not None:
+        watchlist = watchlist_override
+    elif os.environ.get("GOOGLE_CREDS_JSON") and os.environ.get("GOOGLE_SHEET_ID"):
+        watchlist = read_watchlist()
+    elif needs_sheet:
+        raise RuntimeError("缺少 Google Sheet 憑證，無法讀取 watchlist")
+    else:
+        watchlist = []
     if limit:
         watchlist = watchlist[:limit]
 
