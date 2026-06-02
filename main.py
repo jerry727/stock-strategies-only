@@ -48,10 +48,7 @@ def run_pipeline(
     if missing:
         raise RuntimeError(f"缺少環境變數: {missing}")
 
-    if needs_sheet:
-        watchlist = read_watchlist()
-    else:
-        watchlist = []
+    watchlist = read_watchlist()
     if limit:
         watchlist = watchlist[:limit]
 
