@@ -1,0 +1,1 @@
+mcp-cli smoke test created by Hermes on 2026-06-11 08:48:56 +0800
